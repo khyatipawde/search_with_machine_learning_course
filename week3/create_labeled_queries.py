@@ -4,6 +4,11 @@ import xml.etree.ElementTree as ET
 import pandas as pd
 import numpy as np
 import csv
+import re
+from IPython.display import display
+
+import nltk
+stemmer = nltk.stem.PorterStemmer()
 
 # Useful if you want to perform stemming.
 import nltk
@@ -16,7 +21,7 @@ output_file_name = r'/workspace/datasets/labeled_query_data.txt'
 
 parser = argparse.ArgumentParser(description='Process arguments.')
 general = parser.add_argument_group("general")
-general.add_argument("--min_queries", default=1,  help="The minimum number of queries per category label (default is 1)")
+general.add_argument("--min_queries", default=10000, help="The minimum number of queries per category label (default is 1)")
 general.add_argument("--output", default=output_file_name, help="the file to output to")
 
 args = parser.parse_args()
@@ -49,8 +54,32 @@ df = pd.read_csv(queries_file_name)[['category', 'query']]
 df = df[df['category'].isin(categories)]
 
 # IMPLEMENT ME: Convert queries to lowercase, and optionally implement other normalization, like stemming.
+df['query'] = df['query'].str.lower()
+# normalize? df['query'].apply(lambda x:(re.sub("[^A-Za-z0-9 ]","", x)))
+df['tokens'] = df['query'].str.split()
+df['stemmed_tokens'] = df['tokens'].apply(lambda x: [stemmer.stem(y) for y in x])
+df['query'] = df['stemmed_tokens'].str.join(' ')
+display(df)
 
 # IMPLEMENT ME: Roll up categories to ancestors to satisfy the minimum number of queries per category.
+parents_dict = parents_df.set_index("category")["parent"]
+parents_dict[root_category_id] = root_category_id
+
+def count_categories_below_threshold():
+    return (df["category"].value_counts() < min_queries).sum()
+
+categories_below_threshold = count_categories_below_threshold()
+print('Init: Categories below threshold: ', categories_below_threshold)
+
+while categories_below_threshold > 0:
+    categories_below_threshold_df = df["category"].value_counts().where(lambda x: x < min_queries).dropna()
+    df["category"] = df["category"].apply(lambda x: parents_dict[x] if x in categories_below_threshold_df else x)
+    categories_below_threshold = count_categories_below_threshold()
+    print('Checkpoint: Categories below threshold: ', categories_below_threshold)
+
+# Print the distinct categories 
+category_count = len(pd.unique(df['category']))
+print('Distinct categories :', category_count)
 
 # Create labels in fastText format.
 df['label'] = '__label__' + df['category']
@@ -59,3 +88,15 @@ df['label'] = '__label__' + df['category']
 df = df[df['category'].isin(categories)]
 df['output'] = df['label'] + ' ' + df['query']
 df[['output']].to_csv(output_file_name, header=False, sep='|', escapechar='\\', quoting=csv.QUOTE_NONE, index=False)
+
+## COMMANDS FOR 1(b) ##
+# shuf /workspace/datasets/labeled_query_data.txt > /workspace/datasets/labeled_queries.txt
+# head -50000 /workspace/datasets/labeled_queries.txt > /workspace/datasets/training_labeled_queries.txt
+# tail -10000 /workspace/datasets/labeled_queries.txt > /workspace/datasets/test_labeled_queries.txt
+# cd /workspace/datasets
+# ~/fastText-0.9.2/fasttext supervised -input training_labeled_queries.txt -output labeled_queries_model -epoch 25
+# ~/fastText-0.9.2/fasttext test labeled_queries_model.bin test_labeled_queries.txt
+
+# head -100000 labeled_queries.txt > training_labeled_queries.txt
+# ~/fastText-0.9.2/fasttext supervised -input training_labeled_queries.txt -output labeled_queries_model -epoch 25
+# ~/fastText-0.9.2/fasttext test labeled_queries_model.bin test_labeled_queries.txt {1,2,3,5}
