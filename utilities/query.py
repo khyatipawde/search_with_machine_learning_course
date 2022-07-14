@@ -9,13 +9,18 @@ import os
 from getpass import getpass
 from urllib.parse import urljoin
 import pandas as pd
+import fasttext
 import fileinput
 import logging
+import re
 
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 logging.basicConfig(format='%(levelname)s:%(message)s')
+
+
+model = fasttext.load_model('../datasets/labeled_queries_model.bin')
 
 # expects clicks and impressions to be in the row
 def create_prior_queries_from_group(
@@ -49,20 +54,32 @@ def create_prior_queries(doc_ids, doc_id_weights,
 
 
 # Hardcoded query here.  Better to use search templates or other query config.
-def create_query(user_query, click_prior_query, filters, sort="_score", sortDir="desc", size=10, source=None, name_param="name"):
-    query_obj = {
-        'size': size,
-        "sort": [
-            {sort: {"order": sortDir}}
-        ],
-        "query": {
-            "function_score": {
-                "query": {
-                    "bool": {
-                        "must": [
-
-                        ],
-                        "should": [  #
+def create_query(user_query, click_prior_query, filters, sort="_score", sortDir="desc", size=10, source=None, name_param="name", categories=None, boost=False):
+    #print("Pre-category filters are: ", filters)
+    query_filters = filters
+    category_boost = {}
+    if categories:
+        print("Selected Categories are: ", categories)
+        if boost:
+            category_boost = {
+                "terms": 
+                    {
+                        "categoryPathIds": categories,
+                        "boost": 10.0
+                    }
+            }
+        else:
+            category_filter = {
+                "terms": {
+                    "categoryPathIds": categories,
+                }
+            }
+            if query_filters:
+                query_filters.append(category_filter)
+            else:
+                query_filters = category_filter
+    
+    match_conditions = [  
                             {
                                 "match": {
                                     name_param: {
@@ -91,7 +108,7 @@ def create_query(user_query, click_prior_query, filters, sort="_score", sortDir=
                                     "minimum_should_match": "2<75%",
                                     "fields": [f"{name_param}^10", "name.hyphens^10", "shortDescription^5",
                                                "longDescription^5", "department^0.5", "sku", "manufacturer", "features",
-                                               "categoryPath"]
+                                              ]
                                 }
                             },
                             {
@@ -110,9 +127,28 @@ def create_query(user_query, click_prior_query, filters, sort="_score", sortDir=
                                     }
                                 }
                             }
-                        ],
+    ]
+
+    if boost:
+        match_conditions.append(category_boost)
+
+    query_obj = {
+        'size': size,
+        "sort": [
+            { 
+                sort : {
+                    "order": sortDir
+                }
+            }
+        ],
+        "query": {
+            "function_score": {
+                "query": {
+                    "bool": {
+                        "must": [],
+                        "should": match_conditions,
                         "minimum_should_match": 1,
-                        "filter": filters  #
+                        "filter": query_filters  # filter by category
                     }
                 },
                 "boost_mode": "multiply",  # how _score and functions are combined
@@ -185,17 +221,58 @@ def create_query(user_query, click_prior_query, filters, sort="_score", sortDir=
         query_obj["_source"] = source
     return query_obj
 
+import nltk
+stemmer = nltk.stem.PorterStemmer()
 
-def search(client, user_query, index="bbuy_products", sort="_score", sortDir="desc", nameParam="name"):
+def normalize_query(query: str) -> str:
+    words = query.split()
+    stemmed_tokens = [stemmer.stem(x) for x in words]
+    normalized_query = ' '.join(stemmed_tokens)
+    return normalized_query
+
+def search(client, user_query, index="bbuy_products", sort="_score", sortDir="desc", nameParam="name", catThreshold=0.0, boost=False, useMultipleProbabilities=True):
     #### W3: classify the query
+    normalized_query = normalize_query(user_query)
+    category_labels, probabilities = model.predict(normalized_query, k=5)
+    print(f'Query: {normalized_query}')
+    print(f'Labels: {category_labels}, Prob: {probabilities}')
     #### W3: create filters and boosts
+    predicted_categories = []
+    sum_of_probs = 0
+    if (catThreshold):
+        for i in range(len(probabilities)):
+            category = category_labels[i][len("__label__"):]
+            if useMultipleProbabilities:
+                sum_of_probs += probabilities[i]
+                predicted_categories.append(category)
+                print(f'Category: {category}, Prob: {probabilities[i]}, Sum: {sum_of_probs}')
+                
+                if sum_of_probs > catThreshold:
+                    break
+
+            elif probabilities[i] > catThreshold:
+                predicted_categories.append(category)
+                print(f'Category: {category}, Prob: {probabilities[i]}')
+        
     # Note: you may also want to modify the `create_query` method above
-    query_obj = create_query(user_query, click_prior_query=None, filters=None, sort=sort, sortDir=sortDir, source=["name", "shortDescription"], name_param=nameParam)
+    query_obj = create_query(user_query, click_prior_query=None, filters=None, sort=sort, sortDir=sortDir, source=["name", "shortDescription","salesRankShortTerm","categoryPathIds","categoryPath"], name_param=nameParam, categories=predicted_categories, boost=boost)
     logging.info(query_obj)
     response = client.search(query_obj, index=index)
     if response and response['hits']['hits'] and len(response['hits']['hits']) > 0:
         hits = response['hits']['hits']
-        print(json.dumps(response, indent=2))
+        # print(json.dumps(response, indent=2))
+        for entry in response["hits"]["hits"]:
+            print("Name: ", entry["_source"]["name"])
+            #print("Short Desc: ", entry["_source"]["shortDescription"])
+            #print("Sales Rank: ", entry["_source"]["salesRankShortTerm"])
+            print("Categories: ", entry["_source"]["categoryPath"])
+            print("Category IDs: ", entry["_source"]["categoryPathIds"])
+            matching_categories = []
+            for id in entry["_source"]["categoryPathIds"]:
+                if id in predicted_categories:
+                    matching_categories.append(id)
+            print("Matching Category IDs: ", matching_categories)
+            print("===================================================")
 
 
 if __name__ == "__main__":
@@ -212,8 +289,12 @@ if __name__ == "__main__":
                          help='The OpenSearch port')
     general.add_argument('--user',
                          help='The OpenSearch admin.  If this is set, the program will prompt for password too. If not set, use default of admin/admin')
-    general.add_argument("-y", '--synonyms', type=bool, default=True,
+    general.add_argument("-y", '--synonyms', type=bool, default=False,
                          help='If set, uses name.synonyms instead of just name')
+    general.add_argument("-t", '--prob_threshold', type=float, default=0.5,
+                         help='Only use predicted categories with a higher threshold for filtering or boosting.')                     
+    general.add_argument("-b", '--boost', type=bool, default=False,
+                         help='If set, we boost using predicted categories for queries')
 
     args = parser.parse_args()
 
@@ -250,8 +331,11 @@ if __name__ == "__main__":
        
         name_param = "name.synonyms" if args.synonyms else "name"
         print(f"Name Param is {name_param}")
-        search(client=opensearch, user_query=query, index=index_name, nameParam=name_param)
-        #### W3: classify the query
+
+        prob_threshold = args.prob_threshold
+        boost = args.boost
+
+        search(client=opensearch, user_query=query, index=index_name, sort="_score", nameParam=name_param, catThreshold=prob_threshold, boost=boost)
 
         print(query_prompt)
 
